@@ -1,0 +1,17 @@
+# Secrets & local environment
+.env
+.env.local
+
+# Virtual environment & Python caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Large model checkpoints & generated data
+checkpoints/*.pt
+checkpoints/*.pth
+data/*.csv
+
+# IDE settings
+.idea/
