@@ -37,3 +37,53 @@ def test_economic_evaluation_deducts_spread_costs():
     zero_cost = evaluate_economic_performance(preds, realized, np.zeros(4), threshold_bps=0.5)
     with_cost = evaluate_economic_performance(preds, realized, np.full(4, 0.5), threshold_bps=0.5)
     assert with_cost["total_net_pnl_bps"] < zero_cost["total_net_pnl_bps"]
+
+
+def test_alpaca_cross_asset_loader_and_fallback(monkeypatch):
+    import pandas as pd
+    from data.alpaca_loader import bars_to_microstructure_features, load_cross_asset_market_data
+
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
+
+    fallback = load_cross_asset_market_data(symbol="TLT", n_fallback_steps=200)
+    assert fallback["features"].shape == (200, 23)
+
+    dummy_bars = pd.DataFrame(
+        {
+            "open": np.linspace(100.0, 102.0, 120),
+            "high": np.linspace(100.2, 102.3, 120),
+            "low": np.linspace(99.8, 101.8, 120),
+            "close": np.linspace(100.1, 102.1, 120),
+            "volume": np.full(120, 50_000.0),
+            "vwap": np.linspace(100.05, 102.05, 120),
+        }
+    )
+    out = bars_to_microstructure_features(dummy_bars)
+    assert out["features"].shape == (120, 23)
+    assert out["features"].dtype == np.float32
+
+
+def test_alpaca_cross_asset_loader_and_fallback(monkeypatch):
+    import pandas as pd
+    from data.alpaca_loader import bars_to_microstructure_features, load_cross_asset_market_data
+
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
+
+    fallback = load_cross_asset_market_data(symbol="TLT", n_fallback_steps=200)
+    assert fallback["features"].shape == (200, 23)
+
+    dummy_bars = pd.DataFrame(
+        {
+            "open": np.linspace(100.0, 102.0, 120),
+            "high": np.linspace(100.2, 102.3, 120),
+            "low": np.linspace(99.8, 101.8, 120),
+            "close": np.linspace(100.1, 102.1, 120),
+            "volume": np.full(120, 50_000.0),
+            "vwap": np.linspace(100.05, 102.05, 120),
+        }
+    )
+    out = bars_to_microstructure_features(dummy_bars)
+    assert out["features"].shape == (120, 23)
+    assert out["features"].dtype == np.float32

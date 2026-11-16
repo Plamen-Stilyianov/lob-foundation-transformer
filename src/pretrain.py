@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from data.lob_simulator import generate_lob_series
+from data.alpaca_loader import load_cross_asset_market_data
 from src.model import LOBFoundationTransformer, LOBTransformerConfig
 
 
@@ -16,18 +16,20 @@ def create_patch_sequences(
     seq_patches: int = 32,
     horizons: tuple[int, ...] = (1, 5, 15),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Slice L2 LOB tick features into non-overlapping patch sequences and forward return targets (bps)."""
+    """Slice market features into non-overlapping patch sequences and forward return targets (bps)."""
     max_h = max(horizons)
     n_ticks = len(features) - max_h
     n_total_patches = n_ticks // patch_size
-    trimmed_ticks = n_total_patches * patch_size
+    if n_total_patches <= seq_patches:
+        raise ValueError(f"Insufficient ticks ({len(features)}) for seq_patches={seq_patches} and patch_size={patch_size}.")
 
+    trimmed_ticks = n_total_patches * patch_size
     patches = features[:trimmed_ticks].reshape(n_total_patches, patch_size * features.shape[1])
 
     patch_end_idx = np.arange(patch_size - 1, trimmed_ticks, patch_size)
     p0 = mid_price[patch_end_idx]
     targets_bps = np.column_stack(
-        [((mid_price[patch_end_idx + h] - p0) / p0) * 1e4 for h in horizons]
+        [((mid_price[patch_end_idx + h] - p0) / (p0 + 1e-8)) * 1e4 for h in horizons]
     ).astype(np.float32)
 
     X_list, Y_patch_list, Y_ret_list = [], [], []
@@ -45,24 +47,45 @@ def create_patch_sequences(
 
 def train_foundation_model(
     cfg: LOBTransformerConfig,
-    regime: str = "calm",
-    n_steps: int = 30_000,
+    symbols: tuple[str, ...] = ("SPY", "QQQ", "TLT", "GLD", "USO"),
+    days_back: int = 21,
+    train_split: float = 0.75,
     seq_patches: int = 32,
-    epochs: int = 4,
+    epochs: int = 8,
     batch_size: int = 64,
     lr: float = 3e-4,
     seed: int = 42,
     checkpoint_path: str | None = "checkpoints/lob_foundation.pt",
-) -> tuple[LOBFoundationTransformer, list[float]]:
-    """Pre-train LOBFoundationTransformer from scratch using mixed precision (bfloat16 on CUDA)."""
+) -> tuple[LOBFoundationTransformer, list[float], dict[str, dict[str, np.ndarray]]]:
+    """Pre-train LOBFoundationTransformer from scratch on real multi-asset market data (bfloat16 on CUDA)."""
     torch.manual_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    sim = generate_lob_series(n_steps=n_steps, regime=regime, seed=seed)
-    X, Y_patch, Y_ret = create_patch_sequences(
-        sim["features"], sim["mid_price"], cfg.patch_size, seq_patches, cfg.horizons
+    X_parts, Yp_parts, Yr_parts = [], [], []
+    oos_splits: dict[str, dict[str, np.ndarray]] = {}
+
+    for idx, sym in enumerate(symbols):
+        data = load_cross_asset_market_data(symbol=sym, days_back=days_back, seed=seed + idx)
+        split_idx = int(len(data["features"]) * train_split)
+
+        X_tr, Yp_tr, Yr_tr = create_patch_sequences(
+            data["features"][:split_idx], data["mid_price"][:split_idx], cfg.patch_size, seq_patches, cfg.horizons
+        )
+        X_parts.append(X_tr)
+        Yp_parts.append(Yp_tr)
+        Yr_parts.append(Yr_tr)
+
+        oos_splits[sym] = {
+            "features": data["features"][split_idx:],
+            "mid_price": data["mid_price"][split_idx:],
+            "half_spread": data["half_spread"][split_idx:],
+        }
+
+    loader = DataLoader(
+        TensorDataset(torch.cat(X_parts), torch.cat(Yp_parts), torch.cat(Yr_parts)),
+        batch_size=batch_size,
+        shuffle=True,
     )
-    loader = DataLoader(TensorDataset(X, Y_patch, Y_ret), batch_size=batch_size, shuffle=True)
 
     model = LOBFoundationTransformer(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.95))
@@ -89,9 +112,7 @@ def train_foundation_model(
 
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 pred_patch, pred_ret = model(bx)
-                loss_patch = F.mse_loss(pred_patch, by_patch)
-                loss_ret = F.huber_loss(pred_ret, by_ret, delta=2.0)
-                loss = loss_patch + 0.25 * loss_ret
+                loss = F.mse_loss(pred_patch, by_patch) + 0.25 * F.huber_loss(pred_ret, by_ret, delta=2.0)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -106,4 +127,4 @@ def train_foundation_model(
         ckpt.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"config": cfg, "state_dict": model.state_dict(), "losses": epoch_losses}, ckpt)
 
-    return model, epoch_losses
+    return model, epoch_losses, oos_splits

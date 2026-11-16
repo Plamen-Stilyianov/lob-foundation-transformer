@@ -1,11 +1,13 @@
 import os
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 
 from data.lob_simulator import generate_lob_series
 
-# Cross-asset universe mirroring QTR asset classes: Equities, Rates, Commodities, FX
+load_dotenv(override=False)
+
 CROSS_ASSET_SYMBOLS: dict[str, str] = {
     "SPY": "Equity",
     "QQQ": "Equity",
@@ -28,13 +30,12 @@ def bars_to_microstructure_features(df: pd.DataFrame, target_dim: int = 23) -> d
     volume = df["volume"].to_numpy(dtype=np.float32)
     vwap = df["vwap"].to_numpy(dtype=np.float32) if "vwap" in df.columns else close
 
-    log_ret = np.diff(np.log(close + 1e-8), prepend=np.log(close + 1e-8)).astype(np.float32)
+    log_ret = np.diff(np.log(close + 1e-8), prepend=np.log(close[0] + 1e-8)).astype(np.float32)
     hl_spread = ((high - low) / (close + 1e-8)).astype(np.float32)
     bar_ofi = ((close - open_p) / (high - low + 1e-6)).astype(np.float32)
     vwap_dev = ((close - vwap) / (vwap + 1e-8)).astype(np.float32)
     log_vol = np.log1p(volume).astype(np.float32)
 
-    # Construct multi-horizon rolling depth/volatility proxy channels to match 23-dim patch encoder
     base_cols = [log_ret, hl_spread, bar_ofi, vwap_dev, log_vol]
     s = pd.Series(log_ret)
     for w in (3, 5, 10, 20, 40, 60):
@@ -59,16 +60,18 @@ def bars_to_microstructure_features(df: pd.DataFrame, target_dim: int = 23) -> d
 def load_cross_asset_market_data(
     symbol: str = "SPY",
     days_back: int = 14,
+    min_bars: int = 512,
     n_fallback_steps: int = 12_000,
     seed: int = 42,
 ) -> dict[str, np.ndarray]:
-    """Fetch real intraday 1-minute bars via alpaca-py when API keys are set; otherwise fall back cleanly."""
+    """Fetch real intraday 1-minute IEX bars via alpaca-py when API keys are set; otherwise fall back cleanly."""
     api_key = os.getenv("ALPACA_API_KEY")
     secret_key = os.getenv("ALPACA_SECRET_KEY")
 
     if not api_key or not secret_key:
         return generate_lob_series(n_steps=n_fallback_steps, regime="calm", seed=seed)
 
+    from alpaca.data.enums import DataFeed
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
@@ -82,10 +85,10 @@ def load_cross_asset_market_data(
         timeframe=TimeFrame.Minute,
         start=start_dt,
         end=end_dt,
+        feed=DataFeed.IEX,
     )
     bars_df = client.get_stock_bars(req).df.reset_index()
-    if bars_df.empty:
+    if len(bars_df) < min_bars:
         return generate_lob_series(n_steps=n_fallback_steps, regime="calm", seed=seed)
 
     return bars_to_microstructure_features(bars_df)
-
